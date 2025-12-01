@@ -1,0 +1,92 @@
+name: Deploy — S3 + CloudFront with Smoke Test + Auto Rollback
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Create timestamp variable
+        id: ts
+        run: echo "TS=$(date -u +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
+
+      - name: Backup current S3 site
+        id: backup
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+        run: |
+          BACKUP_PREFIX="backups/${{ steps.ts.outputs.TS }}"
+          aws s3 cp s3://$S3_BUCKET s3://$S3_BUCKET/$BACKUP_PREFIX --recursive
+          echo "BACKUP_PREFIX=${BACKUP_PREFIX}" >> $GITHUB_OUTPUT
+
+      - name: Deploy new site to S3
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+        run: |
+          aws s3 sync . s3://$S3_BUCKET --delete \
+            --exclude ".git/*" \
+            --exclude ".github/*" \
+            --exclude "node_modules/*"
+          aws s3 cp index.html s3://$S3_BUCKET/index.html --metadata-directive REPLACE \
+            --cache-control "no-cache, no-store, must-revalidate" \
+            --content-type "text/html"
+
+      - name: Create CloudFront invalidation
+        env:
+          DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
+        run: |
+          aws cloudfront create-invalidation --distribution-id $DISTRIBUTION_ID --paths "/*"
+
+      - name: Get CloudFront domain
+        id: domain
+        env:
+          DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
+        run: |
+          DOMAIN=$(aws cloudfront get-distribution --id $DISTRIBUTION_ID --query "Distribution.DomainName" --output text)
+          echo "DOMAIN=${DOMAIN}" >> $GITHUB_OUTPUT
+
+      - name: Smoke Test (check website is healthy)
+        id: smoketest
+        run: |
+          DOMAIN=${{ steps.domain.outputs.DOMAIN }}
+          EXPECTED="Wanderways"
+          echo "Testing https://${DOMAIN}"
+          for i in {1..10}; do
+            BODY=$(curl -s https://${DOMAIN})
+            if echo "$BODY" | grep -q "$EXPECTED"; then
+              echo "Smoke test passed"
+              exit 0
+            fi
+            echo "Retry $i: Site not ready, waiting..."
+            sleep 5
+          done
+          echo "Smoke test FAILED"
+          exit 1
+
+      - name: Auto-Rollback (only if smoke test failed)
+        if: failure() && steps.smoketest.outcome != 'success'
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
+        run: |
+          echo "Rolling back..."
+          aws s3 sync s3://$S3_BUCKET/${{ steps.backup.outputs.BACKUP_PREFIX }}/ s3://$S3_BUCKET/ --delete
+          aws cloudfront create-invalidation --distribution-id $DISTRIBUTION_ID --paths "/*"
+          echo "Rollback complete."
+
+      - name: Deployment Successful
+        if: success()
+        run: echo "Deployment completed successfully!"
